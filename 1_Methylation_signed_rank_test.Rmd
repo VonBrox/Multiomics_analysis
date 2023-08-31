@@ -1,0 +1,137 @@
+---
+title: "Methylation signed rank test"
+output: html_notebook
+---
+
+I downloaded level 3 methylation 450k data from cBioPortal,
+from TCGA Lung Adenocarcinoma (Firehose Legacy)
+https://www.cbioportal.org/study/summary?id=luad_tcga
+(Accessed 2023/08/29)
+
+Output a matched tumor-normal matrix of methylation data
+```{r}
+library(dplyr)
+
+#setwd("C:/Users/lbrockley/Desktop/TCGA_LUAD_cBio_download")
+
+data_methylation_hm450_tumor <- read.table("data_methylation_hm450.txt", header=TRUE, fill=TRUE)
+data_methylation_hm450_normal <- read.table("data_methylation_hm450_normals.txt", header=TRUE, fill=TRUE)
+
+allIDs_tumor <- colnames(data_methylation_hm450_tumor)
+allIDs_normal <- colnames(data_methylation_hm450_normal)
+
+#Getting the IDs of tumors that have matched normals by replacing the tissue IDs, for matching purposes
+IDs_tumor_with_matches <-gsub(".11",".01", allIDs_normal)
+
+#Make a table of the methylation data for tumor samples only with matching normal data.
+#
+data_methylation_hm450_tumor_with_matches <- data_methylation_hm450_tumor %>%
+  select(any_of(IDs_tumor_with_matches))
+
+#Make a table of the methylation data for normal samples only with matching tumor data.
+#
+# Note that 3 of the normal samples don't have a matching tumor sample:
+#`TCGA.44.2655.01`, `TCGA.44.2659.01`, and `TCGA.44.2662.01` don't exist.
+data_methylation_hm450_normal_with_matches <- data_methylation_hm450_normal %>%
+  select(-c('TCGA.44.2655.11', 'TCGA.44.2659.11','TCGA.44.2662.11'))
+
+#Make a combined table of matched tumor-normal samples.
+data_methylation_hm450_tumor_normal_matched <- cbind(data_methylation_hm450_tumor_with_matches, data_methylation_hm450_normal_with_matches)[order(c(1:31,1:31))]
+#Remove duplicate gene ID column and the entrez ID columns
+data_methylation_hm450_tumor_normal_matched <- data_methylation_hm450_tumor_normal_matched[,-c(1,3,4)]
+
+#Output as tsv
+write.table(data_methylation_hm450_tumor_normal_matched, file = "data_methylation_hm450_tumor_normal_matched.tsv", sep = "\t", row.names = FALSE )
+
+```
+
+Format the file for the wilcoxon signed-rank test.
+```{r}
+#I want to make the gene names into row names, but I cannot because some gene names appear twice.
+#So, I will rename them with indexes _1 and _2 and figure out  why they appeared twice later.
+#Checking rows of the gene names with duplicates:
+checking_dups <- data_methylation_hm450_tumor_normal_matched[data_methylation_hm450_tumor_normal_matched$Hugo_Symbol.1 %in% c("AGER", "CX3CR1", "F2R", "GADL1", "GCOM1", "KLK10", "PALM2AKAP2", "QSOX1", "RCC1"),]
+#I see that these are not identical rows - the methylation values are different. So, I will go ahead and add suffixes.
+checking_dups <- checking_dups[order(checking_dups$Hugo_Symbol.1),]#Sort by gene name
+checking_dups <- cbind(rownames(checking_dups), checking_dups[,1]) #Keep just the gene names and row names of the original file
+checking_dups[,2] <- paste(checking_dups[,2],1:2,sep="_")#Add a suffix to the gene names
+
+#Replace the gene names in the T-NM matched file with the suffixed gene names - change file name slightly.
+data_methylation_hm450_tumor_normal_matched[checking_dups[,1],1] <- checking_dups[,2]
+
+#Now that there are no longer duplicates, make the gene names column into the row names and remove the gene names column
+rownames(data_methylation_hm450_tumor_normal_matched) <- data_methylation_hm450_tumor_normal_matched[,1]
+data_methylation_hm450_tumor_normal_matched <- data_methylation_hm450_tumor_normal_matched[,2:59]
+
+#Now we are ready to do the tumor-normal comparisons! Probably best to use the wilcoxon signed-rank test 
+```
+
+Function to remove a tumor-normal pair if one of them has an NA value, authored by chatGPT (sadly). I will use it in the subsequent Wilcox signed-rank test.
+
+```{r}
+remove_NA_pairs <- function(my_data) {
+  valid_columns <- c()
+  # Iterate through columns in pairs
+  for (i in seq(1, ncol(my_data), by = 2)) {
+    tumor_col <- my_data[, i]
+    normal_col <- my_data[, i+1]
+    # Check for NAs in the pair of columns
+    if (!any(is.na(tumor_col)) && !any(is.na(normal_col))) {
+      valid_columns <- c(valid_columns, i, i+1)
+    }
+  }
+  # Subset the data frame using valid column indices
+  result_data <- my_data[, valid_columns]
+  return (result_data)
+}
+```
+
+Perform the wilcoxon signed-rank test for significant log2 fold change between tumor and normal.
+I based the script on this tutorial: https://rpubs.com/LiYumei/806213
+I will specify 'paired' to make it a signed-rank rather than rank-sum test.
+```{r}
+#Shorter name for convenience
+methyl_beta <- data_methylation_hm450_tumor_normal_matched
+
+#Run the Wilcoxon signed-rank test for each gene 
+#(paired=TRUE specifies signed-rank, na.action=na.fail specifies that an error message will be thrown if NAs are still remaining after the filtering step))
+#
+pvalues <- sapply(1:nrow(methyl_beta),function(i){
+     beta_values <- methyl_beta[i,]
+     
+     #Remove values from tumor-normal pairs either of them is NA
+     beta_values <- remove_NA_pairs(beta_values)
+     
+     #Make group labels to differentiate tumor and normal
+     group <- rep(c(1,2),length(beta_values))
+     data<-cbind.data.frame(gene=as.numeric(t(beta_values)),group)
+     
+     p=wilcox.test(gene~group, data, paired = TRUE, na.action = na.fail)$p.value
+     return(p)
+   })
+#Note that this gives the warning: "Warning: cannot compute exact p-value with ties" several times. This means that there are some beta values that are tied?
+
+#Note that if you use don't use the remove_NA_pairs filtering step, and you use na.action=na.pass, you also don't get any error messages, and it's possible that this is fine and skips over the pairs with NAs. I'm just not sure whether it messes with the analysis, so I filtered first using the remove_NA_pairs function.
+
+#Return false discovery rate - corrected P-values
+fdr=p.adjust(pvalues,method = "fdr")
+
+#Calculate log fold change
+tumor_indexes = seq(1, ncol(methyl_beta), by = 2)
+normal_indexes = seq(2, ncol(methyl_beta), by = 2)
+
+tumor_values=methyl_beta[,tumor_indexes]
+normal_values=methyl_beta[,normal_indexes]
+foldChanges=log2(rowMeans(tumor_values, na.rm = TRUE)/rowMeans(normal_values, na.rm = TRUE))
+
+#Output results to a unified table!
+DMeth_LUAD_TvsNM_hm450 <-data.frame(log2foldChange=foldChanges, pValues=pvalues, FDR=fdr)
+rownames(DMeth_LUAD_TvsNM_hm450)=rownames(methyl_beta)
+DMeth_LUAD_TvsNM_hm450=na.omit(DMeth_LUAD_TvsNM_hm450)
+fdrThres=0.05
+write.table(DMeth_LUAD_TvsNM_hm450[DMeth_LUAD_TvsNM_hm450$FDR<fdrThres,], file="DMeth_LUAD_TvsNM_hm450.tsv",sep="\t", quote=F,row.names = T,col.names = T)
+
+```
+
+
+
